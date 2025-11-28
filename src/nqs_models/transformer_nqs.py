@@ -72,6 +72,12 @@ class TransformerNQS(nn.Module):
         # simple learnable positional embeddings
         self.pos_emb = nn.Parameter(torch.zeros(1, self.n_visible, config.d_model))
 
+        # causal mask: position i cannot attend to position j >= i
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.ones(self.n_visible, self.n_visible) * float('-inf'), diagonal=1)
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute per-site logits for p(σ_i | σ_{<i}).
 
@@ -92,18 +98,77 @@ class TransformerNQS(nn.Module):
         h = self.input_embed(x.unsqueeze(-1))
         h = h + self.pos_emb[:, :n, :]
 
-        # causal masking can be added later; for now we use full self-attention
-        h = self.encoder(h)
+        # apply causal masking for autoregressive modeling
+        h = self.encoder(h, mask=self.causal_mask)
         logits = self.output_head(h).squeeze(-1)
         return logits
+
+    def log_psi_from_logits(self, x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """Compute log ψ(x) from model logits.
+
+        For autoregressive NQS: ψ(σ) ∝ √p(σ) where p(σ) = ∏_i p(σ_i | σ_{<i})
+        Therefore: log ψ(σ) = (1/2) * log p(σ) = (1/2) * Σ_i log p(σ_i | σ_{<i})
+
+        Parameters
+        ----------
+        x:
+            Binary configurations, shape (batch, n_visible).
+        logits:
+            Model logits for each position, shape (batch, n_visible).
+
+        Returns
+        -------
+        log_psi:
+            Log wavefunction amplitudes, shape (batch,).
+
+        Notes
+        -----
+        For each position i, the autoregressive probability is:
+            p(σ_i | σ_{<i}) = sigmoid(logits_i)^σ_i * (1-sigmoid(logits_i))^(1-σ_i)
+
+        In log space:
+            log p(σ_i | σ_{<i}) = σ_i * log(sigmoid(logits_i)) + (1-σ_i) * log(1-sigmoid(logits_i))
+                                 = σ_i * logits_i - log(1 + exp(logits_i))
+                                 = -binary_cross_entropy_with_logits(logits_i, σ_i)
+        """
+        # Compute log p(σ_i | σ_{<i}) for each position
+        # Using the stable formula: -BCE(logits, x)
+        log_prob_per_site = -nn.functional.binary_cross_entropy_with_logits(
+            logits, x.float(), reduction="none"
+        )  # (batch, n_visible)
+
+        # Sum over sites to get log p(σ)
+        log_prob = log_prob_per_site.sum(dim=-1)  # (batch,)
+
+        # ψ(σ) ∝ √p(σ), so log ψ = (1/2) * log p
+        log_psi = 0.5 * log_prob
+
+        return log_psi
+
+    def log_psi(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute log ψ(x) for the autoregressive model.
+
+        This is the main method used by VMC training.
+
+        Parameters
+        ----------
+        x:
+            Binary configurations, shape (batch, n_visible).
+
+        Returns
+        -------
+        log_psi:
+            Log wavefunction amplitudes, shape (batch,).
+        """
+        logits = self.forward(x)
+        return self.log_psi_from_logits(x, logits)
 
     @torch.no_grad()
     def log_prob(self, x: torch.Tensor) -> torch.Tensor:
         """Compute log p(x) under the model (teacher-forced).
 
-        This is a simple teacher-forced cross-entropy style computation. For
-        a fully autoregressive model you may want to add an explicit causal
-        mask and compute p(σ_i | σ_{<i}).
+        This computes the full log probability log p(σ) = Σ_i log p(σ_i | σ_{<i}).
+        Note: log ψ = (1/2) * log p
         """
         logits = self.forward(x)
         log_p = -nn.functional.binary_cross_entropy_with_logits(

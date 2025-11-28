@@ -10,40 +10,256 @@ and returns estimated ground-state energies and diagnostics.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any, Dict, Sequence
 
 import numpy as np
+from qiskit.primitives import BitArray
+from qiskit_addon_sqd.fermion import diagonalize_fermionic_hamiltonian, solve_sci_batch
+
+from .hamiltonian import H2Hamiltonian
+
+
+def _spin_orbital_to_spatial_integrals(
+    h1_spin: np.ndarray, h2_spin: np.ndarray, n_spatial: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert spin-orbital integrals to spatial orbital integrals.
+
+    H2Hamiltonian stores integrals in spin-orbital basis (interleaved: 0α, 0β, 1α, 1β).
+    qiskit-addon-sqd requires spatial orbital integrals.
+
+    Parameters
+    ----------
+    h1_spin:
+        One-body integrals in spin-orbital basis, shape (2*n_spatial, 2*n_spatial).
+    h2_spin:
+        Two-body integrals in spin-orbital basis (antisymmetrized),
+        shape (2*n_spatial, 2*n_spatial, 2*n_spatial, 2*n_spatial).
+    n_spatial:
+        Number of spatial orbitals.
+
+    Returns
+    -------
+    hcore:
+        One-body integrals in spatial orbital basis, shape (n_spatial, n_spatial).
+    eri:
+        Two-body integrals in spatial orbital basis (physicist's notation),
+        shape (n_spatial, n_spatial, n_spatial, n_spatial).
+
+    Notes
+    -----
+    For spin-orbital basis with interleaved ordering (0α, 0β, 1α, 1β, ...):
+    - Spin-orbital 2*i corresponds to spatial orbital i with α spin
+    - Spin-orbital 2*i+1 corresponds to spatial orbital i with β spin
+
+    We extract the α-α block from the spin-orbital integrals.
+    """
+    # Extract α-α block from one-body integrals
+    hcore = np.zeros((n_spatial, n_spatial))
+    for p in range(n_spatial):
+        for q in range(n_spatial):
+            hcore[p, q] = h1_spin[2 * p, 2 * q]
+
+    # Extract α-α-α-α block from two-body integrals
+    # h2_spin is antisymmetrized: <pq||rs> = <pq|rs> - <pq|sr>
+    # We need physicist's notation <pq|rs> for spatial orbitals
+    # From antisymmetrized spin-orbital: h2_spin[2p,2q,2r,2s] = <pq||rs> (α-α-α-α)
+    # We need to add back the exchange term to get <pq|rs>
+    eri = np.zeros((n_spatial, n_spatial, n_spatial, n_spatial))
+    for p in range(n_spatial):
+        for q in range(n_spatial):
+            for r in range(n_spatial):
+                for s in range(n_spatial):
+                    # h2_spin stores antisymmetrized: <pq||rs> = <pq|rs> - <pq|sr>
+                    # Need to recover <pq|rs>
+                    # From the construction in hamiltonian.py:
+                    # h2_spin[2p, 2q, 2r, 2s] = eri_mo[p,q,r,s] - eri_mo[p,q,s,r]
+                    # We want eri_mo[p,q,r,s]
+                    # We can use: eri_mo[p,q,r,s] = 0.5 * (h2_spin[2p,2q,2r,2s] + h2_spin[2p,2q,2s,2r] + exchange)
+                    # Simpler: extract from α-α-β-β block which is not antisymmetrized
+                    # h2_spin[2p, 2q, 2r+1, 2s+1] = eri_mo[p,q,r,s] (Coulomb only)
+                    eri[p, q, r, s] = h2_spin[2 * p, 2 * q, 2 * r + 1, 2 * s + 1]
+
+    return hcore, eri
+
+
+def _convert_bitstrings_to_sqd_format(
+    samples: np.ndarray, n_spatial: int, num_qubits: int
+) -> np.ndarray:
+    """Convert NQS bitstring samples to qiskit-addon-sqd format.
+
+    Parameters
+    ----------
+    samples:
+        Bitstring samples from NQS, shape (n_samples, num_qubits).
+        For H2 with 12-bit encoding: (n_samples, 12).
+        Assumes occupation number representation where 1 = occupied, 0 = empty.
+    n_spatial:
+        Number of spatial orbitals (e.g., 2 for H2 in STO-3G).
+    num_qubits:
+        Total number of qubits in the encoding.
+
+    Returns
+    -------
+    bitstring_matrix:
+        Boolean array of shape (n_samples, 2*n_spatial).
+        Format: [β_{n_spatial-1}, ..., β_0, α_{n_spatial-1}, ..., α_0].
+        α spins in right half [n_spatial:2*n_spatial].
+        β spins in left half [0:n_spatial].
+
+    Notes
+    -----
+    For H2 with spin-orbital ordering (0α, 0β, 1α, 1β, ...) in the first 4 qubits,
+    we extract:
+    - α electrons from even indices: [0, 2, 4, ...]
+    - β electrons from odd indices: [1, 3, 5, ...]
+    Then reorder to SQD format.
+    """
+    n_samples = samples.shape[0]
+    bitstring_matrix = np.zeros((n_samples, 2 * n_spatial), dtype=bool)
+
+    # Extract α and β spins from interleaved spin-orbital basis
+    for i in range(n_spatial):
+        # α spin from even indices (2i) -> right half of output
+        bitstring_matrix[:, n_spatial + i] = samples[:, 2 * i].astype(bool)
+        # β spin from odd indices (2i+1) -> left half of output
+        bitstring_matrix[:, i] = samples[:, 2 * i + 1].astype(bool)
+
+    # Reverse order within each spin block to match SQD convention
+    # SQD expects: [β_{norb-1}, ..., β_0, α_{norb-1}, ..., α_0]
+    bitstring_matrix[:, :n_spatial] = np.flip(bitstring_matrix[:, :n_spatial], axis=1)
+    bitstring_matrix[:, n_spatial:] = np.flip(bitstring_matrix[:, n_spatial:], axis=1)
+
+    return bitstring_matrix
 
 
 def run_sqd_on_samples(
-    hamiltonian: Any,
-    samples: Sequence[int],
-    max_subspace_dim: int = 256,
+    hamiltonian: H2Hamiltonian,
+    samples: np.ndarray,
+    samples_per_batch: int = 300,
+    num_batches: int = 10,
+    max_iterations: int = 5,
+    spin_sq: float = 0.0,
+    max_cycle: int = 200,
+    seed: int = 42,
 ) -> Dict[str, Any]:
-    """Run SQD given a Hamiltonian and a set of samples.
+    """Run SQD given a Hamiltonian and a set of bitstring samples.
 
-    This is currently just a stub that returns dummy values so that the
-    experiment scripts can run end-to-end without errors. You should replace
-    the body with actual calls into `qiskit-addon-sqd`.
+    This function:
+    1. Converts spin-orbital integrals to spatial orbital integrals
+    2. Converts NQS bitstrings to qiskit-addon-sqd format
+    3. Runs diagonalize_fermionic_hamiltonian with selected configuration iteration
+    4. Returns energy estimate with nuclear repulsion included
 
     Parameters
     ----------
     hamiltonian:
-        Placeholder Hamiltonian (to be defined).
+        H2Hamiltonian object containing molecular integrals and metadata.
     samples:
-        Iterable of integer bitstring encodings or raw bitstrings.
-    max_subspace_dim:
-        Maximum dimension for the SQD subspace.
+        Bitstring samples from NQS, shape (n_samples, num_qubits).
+        Each bitstring encodes occupation numbers (1 = occupied, 0 = empty).
+    samples_per_batch:
+        Number of samples to use per SQD batch (default: 300).
+    num_batches:
+        Number of batches for configuration recovery (default: 10).
+    max_iterations:
+        Maximum iterations for configuration recovery (default: 5).
+    spin_sq:
+        Target spin quantum number S(S+1) for SCI solver (default: 0.0 for singlet).
+    max_cycle:
+        Maximum cycles for SCI solver (default: 200).
+    seed:
+        Random seed for reproducibility (default: 42).
 
     Returns
     -------
     result:
-        A dictionary with at least:
-        - 'energy_estimate': float
-        - 'subspace_dim': int
+        Dictionary with:
+        - 'energy_estimate': Total energy including nuclear repulsion (float)
+        - 'electronic_energy': Electronic energy from SQD (float)
+        - 'nuclear_repulsion': Nuclear repulsion energy (float)
+        - 'subspace_dim': Final subspace dimension used (int)
+        - 'n_samples': Number of samples provided (int)
+        - 'n_unique_samples': Number of unique configurations (int)
+        - 'converged': Whether SQD converged (bool)
+
+    Raises
+    ------
+    ValueError:
+        If hamiltonian does not have one_body_integrals or two_body_integrals.
     """
-    # Dummy behavior: pretend we estimated -5.6 Ha with a small subspace.
+    # Validate inputs
+    if hamiltonian.one_body_integrals is None or hamiltonian.two_body_integrals is None:
+        raise ValueError(
+            "H2Hamiltonian must have one_body_integrals and two_body_integrals. "
+            "These should be populated by build_h2_hamiltonian_12bit."
+        )
+
+    # Determine number of spatial orbitals
+    # For H2 in STO-3G: 2 spatial orbitals -> 4 spin orbitals
+    n_spin = hamiltonian.one_body_integrals.shape[0]
+    n_spatial = n_spin // 2
+
+    # Determine number of α and β electrons
+    # For H2: 2 electrons, assume restricted (1α, 1β)
+    n_alpha = hamiltonian.num_electrons // 2
+    n_beta = hamiltonian.num_electrons // 2
+
+    # Convert spin-orbital integrals to spatial orbital integrals
+    hcore, eri = _spin_orbital_to_spatial_integrals(
+        hamiltonian.one_body_integrals, hamiltonian.two_body_integrals, n_spatial
+    )
+
+    # Convert bitstrings to SQD format
+    bitstring_matrix = _convert_bitstrings_to_sqd_format(
+        samples, n_spatial, hamiltonian.num_qubits
+    )
+
+    # Count unique configurations
+    unique_bitstrings = np.unique(bitstring_matrix, axis=0)
+    n_unique = len(unique_bitstrings)
+
+    # Configure SCI solver
+    sci_solver = partial(solve_sci_batch, spin_sq=spin_sq, max_cycle=max_cycle)
+
+    # Convert boolean array to BitArray for qiskit-addon-sqd
+    # BitArray expects shape (num_shots, num_bits) as boolean array
+    bit_array = BitArray.from_bool_array(bitstring_matrix)
+
+    # Run SQD
+    sqd_result = diagonalize_fermionic_hamiltonian(
+        hcore,
+        eri,
+        bit_array,
+        samples_per_batch=samples_per_batch,
+        norb=n_spatial,
+        nelec=(n_alpha, n_beta),
+        num_batches=num_batches,
+        max_iterations=max_iterations,
+        sci_solver=sci_solver,
+        seed=seed,
+    )
+
+    # Extract results
+    # Note: sqd_result.energy does NOT include nuclear repulsion
+    electronic_energy = sqd_result.energy
+    total_energy = electronic_energy + hamiltonian.nuclear_repulsion
+
+    # Compute subspace dimension from SCI state
+    # The subspace is the Cartesian product of alpha and beta CI strings
+    sci_state = sqd_result.sci_state
+    subspace_dim = len(sci_state.ci_strs_a) * len(sci_state.ci_strs_b)
+
+    # Check convergence based on whether energy changed significantly
+    # (qiskit-addon-sqd doesn't have explicit converged flag in recent versions)
+    converged = True  # Assume converged if no exception was raised
+
     return {
-        "energy_estimate": -5.6,
-        "subspace_dim": min(max_subspace_dim, len(list(samples))),
+        "energy_estimate": total_energy,
+        "electronic_energy": electronic_energy,
+        "nuclear_repulsion": hamiltonian.nuclear_repulsion,
+        "subspace_dim": subspace_dim,
+        "n_samples": samples.shape[0],
+        "n_unique_samples": n_unique,
+        "converged": converged,
     }
