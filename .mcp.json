@@ -1,0 +1,9 @@
+{
+  "shell": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-shell"
+    ]
+  }
+}

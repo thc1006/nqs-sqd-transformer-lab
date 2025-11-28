@@ -1,0 +1,29 @@
+[project]
+name = "nqs-sqd-transformer-lab"
+version = "0.1.0"
+description = "NQS-guided Sample-based Quantum Diagonalization with FFNN and Transformer samplers."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "qiskit>=1.2.0",
+  "qiskit-addon-sqd>=0.1.0",
+  "torch>=2.1.0",
+  "numpy>=1.26",
+  "scipy>=1.13",
+  "matplotlib>=3.8",
+  "pandas>=2.1",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+  "einops>=0.8.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ipykernel",
+  "jupyterlab"
+]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
