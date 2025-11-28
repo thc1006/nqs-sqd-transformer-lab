@@ -20,13 +20,59 @@ from qiskit_addon_sqd.fermion import diagonalize_fermionic_hamiltonian, solve_sc
 from .hamiltonian import H2Hamiltonian
 
 
+def _get_spatial_integrals_from_pyscf(bond_length: float) -> tuple[np.ndarray, np.ndarray]:
+    """Compute spatial orbital integrals directly from PySCF.
+
+    This bypasses the spin-orbital integrals stored in H2Hamiltonian and
+    computes fresh integrals in the correct format for qiskit-addon-sqd.
+
+    Parameters
+    ----------
+    bond_length:
+        H-H bond length in Angstrom.
+
+    Returns
+    -------
+    hcore:
+        One-body integrals in spatial orbital basis (MO), shape (n_spatial, n_spatial).
+    eri:
+        Two-body integrals in chemist's notation (pq|rs) in MO basis,
+        shape (n_spatial, n_spatial, n_spatial, n_spatial).
+    """
+    from pyscf import gto, scf, ao2mo
+
+    mol = gto.M(
+        atom=f"H 0 0 0; H 0 0 {bond_length}",
+        basis="sto-3g",
+        unit="angstrom",
+        verbose=0,
+    )
+    mf = scf.RHF(mol)
+    mf.kernel()
+
+    mo_coeff = mf.mo_coeff
+    n_spatial = mol.nao_nr()
+
+    # One-body integrals in MO basis
+    hcore = mo_coeff.T @ mf.get_hcore() @ mo_coeff
+
+    # Two-body integrals using ao2mo (handles conventions correctly)
+    eri_packed = ao2mo.kernel(mol, mo_coeff)
+    eri = ao2mo.restore(1, eri_packed, n_spatial)  # Restore to 4-index tensor
+
+    return hcore, eri
+
+
 def _spin_orbital_to_spatial_integrals(
     h1_spin: np.ndarray, h2_spin: np.ndarray, n_spatial: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert spin-orbital integrals to spatial orbital integrals.
 
+    WARNING: This function has known issues with integral conventions.
+    Consider using _get_spatial_integrals_from_pyscf() instead.
+
     H2Hamiltonian stores integrals in spin-orbital basis (interleaved: 0α, 0β, 1α, 1β).
-    qiskit-addon-sqd requires spatial orbital integrals.
+    qiskit-addon-sqd requires spatial orbital integrals in chemist's notation.
 
     Parameters
     ----------
@@ -43,16 +89,8 @@ def _spin_orbital_to_spatial_integrals(
     hcore:
         One-body integrals in spatial orbital basis, shape (n_spatial, n_spatial).
     eri:
-        Two-body integrals in spatial orbital basis (physicist's notation),
+        Two-body integrals in spatial orbital basis (chemist's notation (pq|rs)),
         shape (n_spatial, n_spatial, n_spatial, n_spatial).
-
-    Notes
-    -----
-    For spin-orbital basis with interleaved ordering (0α, 0β, 1α, 1β, ...):
-    - Spin-orbital 2*i corresponds to spatial orbital i with α spin
-    - Spin-orbital 2*i+1 corresponds to spatial orbital i with β spin
-
-    We extract the α-α block from the spin-orbital integrals.
     """
     # Extract α-α block from one-body integrals
     hcore = np.zeros((n_spatial, n_spatial))
@@ -60,24 +98,14 @@ def _spin_orbital_to_spatial_integrals(
         for q in range(n_spatial):
             hcore[p, q] = h1_spin[2 * p, 2 * q]
 
-    # Extract α-α-α-α block from two-body integrals
-    # h2_spin is antisymmetrized: <pq||rs> = <pq|rs> - <pq|sr>
-    # We need physicist's notation <pq|rs> for spatial orbitals
-    # From antisymmetrized spin-orbital: h2_spin[2p,2q,2r,2s] = <pq||rs> (α-α-α-α)
-    # We need to add back the exchange term to get <pq|rs>
+    # The two-body integrals in h2_spin are stored in the α-α-β-β block as
+    # the original MO chemist's notation integrals (pq|rs).
+    # h2_spin[2p, 2q, 2r+1, 2s+1] = eri_mo[p, q, r, s] = (pq|rs)_chemist
     eri = np.zeros((n_spatial, n_spatial, n_spatial, n_spatial))
     for p in range(n_spatial):
         for q in range(n_spatial):
             for r in range(n_spatial):
                 for s in range(n_spatial):
-                    # h2_spin stores antisymmetrized: <pq||rs> = <pq|rs> - <pq|sr>
-                    # Need to recover <pq|rs>
-                    # From the construction in hamiltonian.py:
-                    # h2_spin[2p, 2q, 2r, 2s] = eri_mo[p,q,r,s] - eri_mo[p,q,s,r]
-                    # We want eri_mo[p,q,r,s]
-                    # We can use: eri_mo[p,q,r,s] = 0.5 * (h2_spin[2p,2q,2r,2s] + h2_spin[2p,2q,2s,2r] + exchange)
-                    # Simpler: extract from α-α-β-β block which is not antisymmetrized
-                    # h2_spin[2p, 2q, 2r+1, 2s+1] = eri_mo[p,q,r,s] (Coulomb only)
                     eri[p, q, r, s] = h2_spin[2 * p, 2 * q, 2 * r + 1, 2 * s + 1]
 
     return hcore, eri
@@ -142,11 +170,12 @@ def run_sqd_on_samples(
     spin_sq: float = 0.0,
     max_cycle: int = 200,
     seed: int = 42,
+    bond_length: float = 0.74,
 ) -> Dict[str, Any]:
     """Run SQD given a Hamiltonian and a set of bitstring samples.
 
     This function:
-    1. Converts spin-orbital integrals to spatial orbital integrals
+    1. Computes spatial orbital integrals directly from PySCF
     2. Converts NQS bitstrings to qiskit-addon-sqd format
     3. Runs diagonalize_fermionic_hamiltonian with selected configuration iteration
     4. Returns energy estimate with nuclear repulsion included
@@ -170,6 +199,8 @@ def run_sqd_on_samples(
         Maximum cycles for SCI solver (default: 200).
     seed:
         Random seed for reproducibility (default: 42).
+    bond_length:
+        H-H bond length in Angstrom (default: 0.74 for equilibrium H₂).
 
     Returns
     -------
@@ -188,27 +219,22 @@ def run_sqd_on_samples(
     ValueError:
         If hamiltonian does not have one_body_integrals or two_body_integrals.
     """
-    # Validate inputs
-    if hamiltonian.one_body_integrals is None or hamiltonian.two_body_integrals is None:
-        raise ValueError(
-            "H2Hamiltonian must have one_body_integrals and two_body_integrals. "
-            "These should be populated by build_h2_hamiltonian_12bit."
-        )
-
     # Determine number of spatial orbitals
     # For H2 in STO-3G: 2 spatial orbitals -> 4 spin orbitals
-    n_spin = hamiltonian.one_body_integrals.shape[0]
-    n_spatial = n_spin // 2
+    if hamiltonian.one_body_integrals is not None:
+        n_spin = hamiltonian.one_body_integrals.shape[0]
+        n_spatial = n_spin // 2
+    else:
+        # Default for H2 in STO-3G
+        n_spatial = 2
 
     # Determine number of α and β electrons
     # For H2: 2 electrons, assume restricted (1α, 1β)
     n_alpha = hamiltonian.num_electrons // 2
     n_beta = hamiltonian.num_electrons // 2
 
-    # Convert spin-orbital integrals to spatial orbital integrals
-    hcore, eri = _spin_orbital_to_spatial_integrals(
-        hamiltonian.one_body_integrals, hamiltonian.two_body_integrals, n_spatial
-    )
+    # Get spatial orbital integrals directly from PySCF (correct convention)
+    hcore, eri = _get_spatial_integrals_from_pyscf(bond_length)
 
     # Convert bitstrings to SQD format
     bitstring_matrix = _convert_bitstrings_to_sqd_format(

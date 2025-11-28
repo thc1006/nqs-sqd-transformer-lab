@@ -1,10 +1,47 @@
 # Project Context: NQS-guided SQD with FFNN + Transformer Samplers
 
-You are collaborating with Ting-Yi (蔡秀吉) on a quantum chemistry research project.
+You are collaborating with (蔡秀吉) on a quantum chemistry research project.
 
 The goal is to study **sample-efficient Sample-based Quantum Diagonalization (SQD)**
 using **Neural Quantum States (NQS)** as classical samplers, for small molecules
 (starting from H₂) under **12–14-bit encodings**.
+
+斷線恢復時，請先讀取 `docs/實驗記錄.md` 查看完整實驗歷程。
+
+## 當前進度 (2024-11-28)
+
+### 已完成
+
+1. **VMC 化學精度達成**: ComplexFFNNNQS 達到 0.047 mHa (目標 1.6 mHa)
+2. **SQD 整合完成**: 4-qubit H2 達到 0.000 mHa (精確 FCI)
+3. **關鍵發現**: 實數 NQS 的 20.5 mHa 瓶頸源於符號問題，複數波函數解決此問題
+
+### 下一步: 12-qubit H2 測試
+
+目的: 4-qubit 系統太小 (僅 4 個物理配置)，無法展示 NQS 取樣優勢。需要更大系統。
+
+執行步驟:
+1. 使用現有 `build_h2_hamiltonian_12bit()` 建構 12-qubit Hamiltonian
+2. 訓練 ComplexFFNNNQS (配置空間: 36 個 (1a,1b) 配置)
+3. 比較 Random vs NQS 取樣的樣本效率
+4. 指標: 達到化學精度所需的樣本數
+
+預估時間: 5-15 分鐘
+
+相關檔案:
+- `test_nqs_sqd_integration.py`: 整合測試腳本
+- `src/sqd_interface/sqd_runner.py`: SQD 執行器 (已修復積分格式問題)
+- `src/sqd_interface/sampling_adapters.py`: 取樣器適配器 (含 ComplexFFNNSampler)
+
+實作時請務必保持程式碼自然，不要讓人看出是 AI 生成。此外，實作也請務必遵循 Code Readability，記住代碼是寫給人看的，所以要有自然的代碼流程
+
+### 關鍵參考檔案 (已驗證有效)
+
+> 暫時權限密碼：Kinoshita15@
+
+所有紀錄用的文檔都必須要精簡但保留所有必要的關鍵的資訊，遵循 TLDR，同時不可以有任何的 emoji。
+
+> 此外整體專案都要有良好的檔案結構。
 
 We focus on two ansatz families:
 

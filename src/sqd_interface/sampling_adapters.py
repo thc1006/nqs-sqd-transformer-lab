@@ -8,7 +8,7 @@ from typing import Protocol
 import numpy as np
 import torch
 
-from src.nqs_models.ffn_nqs import FFNNNQS
+from src.nqs_models.ffn_nqs import FFNNNQS, ComplexFFNNNQS
 from src.nqs_models.transformer_nqs import TransformerNQS
 
 
@@ -143,6 +143,75 @@ class TransformerSampler:
 
         # Filter to correct alpha AND beta counts
         valid_mask = (alpha_counts == n_alpha) & (beta_counts == n_beta)
+        valid_samples = all_samples_np[valid_mask]
+
+        if len(valid_samples) >= n_samples:
+            return valid_samples[:n_samples].astype("int8")
+        else:
+            return valid_samples.astype("int8") if len(valid_samples) > 0 else all_samples_np[:n_samples].astype("int8")
+
+
+@dataclass
+class ComplexFFNNSampler:
+    """Adapter that uses a ComplexFFNNNQS model as a sampler.
+
+    The complex NQS has separate amplitude and phase networks.
+    Sampling is based on |ψ(x)|² (amplitude only), so it works
+    the same as real NQS for sampling purposes.
+
+    Includes optional postselection to enforce spin-sector conservation.
+    For physical fermionic systems, we filter by (n_α, n_β) counts.
+
+    In the Jordan-Wigner encoding with interleaved spin-orbitals:
+    - Even indices (0, 2, 4, ...) are α spin-orbitals
+    - Odd indices (1, 3, 5, ...) are β spin-orbitals
+    """
+
+    model: ComplexFFNNNQS
+    device: torch.device
+    n_alpha: int | None = None  # If set, postselect to this α electron count
+    n_beta: int | None = None   # If set, postselect to this β electron count
+
+    def sample(self, n_samples: int, oversample_factor: int = 50) -> np.ndarray:
+        """Sample bitstrings from the model.
+
+        Parameters
+        ----------
+        n_samples:
+            Number of samples to return.
+        oversample_factor:
+            When postselecting, oversample by this factor to ensure enough valid samples.
+
+        Returns
+        -------
+        samples:
+            Array of shape (n_samples, n_visible) with 0/1 entries.
+        """
+        if self.n_alpha is None and self.n_beta is None:
+            # No postselection, return raw samples
+            samples = self.model.sample(n_samples=n_samples, device=self.device)
+            return samples.cpu().numpy().astype("int8")
+
+        # Postselect to correct (n_α, n_β) spin sector
+        total_needed = n_samples * oversample_factor
+        all_samples = self.model.sample(n_samples=total_needed, device=self.device)
+        all_samples_np = all_samples.cpu().numpy()
+
+        # Count α and β electrons (interleaved encoding)
+        n_visible = all_samples_np.shape[1]
+        alpha_indices = np.arange(0, n_visible, 2)
+        beta_indices = np.arange(1, n_visible, 2)
+
+        alpha_counts = all_samples_np[:, alpha_indices].sum(axis=1)
+        beta_counts = all_samples_np[:, beta_indices].sum(axis=1)
+
+        # Filter to correct (n_α, n_β) counts
+        valid_mask = np.ones(len(all_samples_np), dtype=bool)
+        if self.n_alpha is not None:
+            valid_mask &= (alpha_counts == self.n_alpha)
+        if self.n_beta is not None:
+            valid_mask &= (beta_counts == self.n_beta)
+
         valid_samples = all_samples_np[valid_mask]
 
         if len(valid_samples) >= n_samples:
